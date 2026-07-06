@@ -1042,14 +1042,35 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// Sync mode: await with timeout
-				const result = await Promise.race([
-					runSingleAgent(
+				// Sync mode: await with timeout via AbortController
+				const timeoutController = new AbortController();
+				const timeoutId = setTimeout(() => timeoutController.abort(new Error("timeout")), SYNC_TIMEOUT_MS);
+
+				// Forward original signal (if any) to timeout controller
+				if (signal) {
+					if (signal.aborted) {
+						clearTimeout(timeoutId);
+						timeoutController.abort(signal.reason);
+					} else {
+						signal.addEventListener("abort", () => {
+							clearTimeout(timeoutId);
+							timeoutController.abort(signal.reason);
+						}, { once: true });
+					}
+				}
+
+				let result: SingleResult;
+				try {
+					result = await runSingleAgent(
 						ctx.cwd, agents, params.agent, params.task, params.cwd,
-						undefined, signal, onUpdate, makeDetails("single"),
-					),
-					new Promise<SingleResult>((resolve) =>
-						setTimeout(() => resolve({
+						undefined, timeoutController.signal, onUpdate, makeDetails("single"),
+					);
+					clearTimeout(timeoutId);
+				} catch (err: unknown) {
+					clearTimeout(timeoutId);
+					const msg = err instanceof Error ? err.message : String(err);
+					if (msg.includes("aborted") || msg.includes("timeout")) {
+						result = {
 							agent: params.agent,
 							agentSource: "unknown",
 							task: params.task,
@@ -1058,9 +1079,11 @@ export default function (pi: ExtensionAPI) {
 							stderr: `Sync execution timed out after ${SYNC_TIMEOUT_MS / 1000}s.`,
 							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 							stopReason: "timeout",
-						}), SYNC_TIMEOUT_MS)
-					),
-				]);
+						};
+					} else {
+						throw err;
+					}
+				}
 				const isError = isFailedResult(result);
 				if (isError) {
 					const errorMsg = getResultOutput(result);
