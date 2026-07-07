@@ -1,3 +1,16 @@
+/**
+ * Subagent Render — TUI components for subagent tool call inline rendering
+ *
+ * Renders the inline subagent widget (agent icon + task preview in
+ * chain/parallel/single modes, and completion status + tool execution summary).
+ *
+ * Key details:
+ *   - renderCall: shows agent name, task preview, scope
+ *   - renderResult: shows completion icon, duration, tool execution summary
+ *   - truncateToWidth prevents TUI overflow on long lines
+ *   - cache (hasToolErrors, resultCache, summary) avoids redundant reconstitution
+ */
+
 import { getMarkdownTheme, keyHint } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import type { SubagentDetails } from "./types.ts";

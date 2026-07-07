@@ -89,6 +89,9 @@ const SubagentParams = Type.Object({
 
 
 export default function (pi: ExtensionAPI) {
+/* ── session-scoped captures ─────────────────────────────
+ * terminate:true 返回后 ctx 失效，异步 close 回调中改用
+ * session_start 阶段捕获的 sessionUi / sessionCwd。 */
 	let sessionUi: ExtensionContext["ui"] | null = null;
 	let sessionCwd: string | null = null;
 
@@ -163,6 +166,9 @@ export default function (pi: ExtensionAPI) {
 				if (projectAgentsRequested.length > 0) {
 					const names = projectAgentsRequested.map((a) => a.name).join(", ");
 					const dir = discovery.projectAgentsDir ?? "(unknown)";
+	/* ── permission gate ───────────────────────────────
+	 * subagent 加入 MUTATING_TOOLS，warn 模式始终拦截，
+	 * strict/deny 按用户配置拒绝或强制确认。 */
 					const ok = await ctx.ui.confirm(
 						"Run project-local agents?",
 						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
@@ -246,6 +252,10 @@ export default function (pi: ExtensionAPI) {
 					};
 
 				if (params.mode === "async") {
+/* ── parallel async: fire all, inject each on completion ──
+ * 用唯一 widgetId 隔离多组并行调用。每个子进程独立
+ * 完成时 sendUserMessage("followUp") 注入结果。
+ * widget 按 50ms 间隔依次 spawn，event-driven 更新。 */
 const widgetId = `subagent-${Date.now()}`;
 					let doneCount = 0;
 					const totalTasks = params.tasks.length;
@@ -349,7 +359,11 @@ const widgetId = `subagent-${Date.now()}`;
 									}
 								} catch { /* ignore */ }
 							}
-							const stateKey = taskEntries.map(e => `${e.icon}|${e.activity?.slice(-20)}`).join("||");
+						/* ── event-driven widget update ────────────────
+				 * stateKey = entry.icon + activity.slice(-20) 的拼接。
+				 * 只有实际变化才触发 TUI 重绘，避免 100ms 轮询导致的
+				 * 无意义渲染和内存增长。固定长度无积累。 */
+					const stateKey = taskEntries.map(e => `${e.icon}|${e.activity?.slice(-20)}`).join("||");
 							if (stateKey !== lastParallelStateKey) {
 								lastParallelStateKey = stateKey;
 								updateWidget();
@@ -443,6 +457,8 @@ const widgetId = `subagent-${Date.now()}`;
 							);
 
 							// Save execution history
+							// 使用 sessionCwd（而非 ctx.cwd）避免 terminate:true 后 ctx 失效的问题。
+							// 日志写入 .pi/subagent-logs/<timestamp>-<agent>/ 下。
 							const endTime = new Date().toISOString();
 							saveSubagentHistory({
 								agent: t.agent,
@@ -577,6 +593,11 @@ const widgetId = `subagent-${Date.now()}`;
 				}
 
 				if (params.mode === "async") {
+				/* ── single async: fire-and-inject ─────────────
+				 * spawn 子进程后立即 return terminate:true。
+				 * 子进程完成时通过 sendUserMessage("followUp") 
+				 * 将结果注入主会话，同时 saveSubagentHistory 持久化。
+				 * widget 用唯一 widgetId 隔离，stateKey 事件驱动更新。 */
 					const widgetId = `subagent-${Date.now()}`;
 					// Async fire-and-inject: spawn immediately, inject result on completion
 					const args: string[] = [
@@ -650,7 +671,10 @@ const widgetId = `subagent-${Date.now()}`;
 							} catch { /* ignore */ }
 						}
 
-						const stateKey = `${toolLines.length}|${latestText?.slice(-30)||""}`;
+						/* ── event-driven widget guard ────────────────
+				 * stateKey = toolLines.length + latestText.slice(-30)，
+				 * 固定长度不增长。只有新工具调用或新文本变化才触发重绘。 */
+					const stateKey = `${toolLines.length}|${latestText?.slice(-30)||""}`;
 						if (stateKey === lastSingleStateKey) return;
 						lastSingleStateKey = stateKey;
 
@@ -708,6 +732,7 @@ const widgetId = `subagent-${Date.now()}`;
 						);
 
 						// Save execution history
+						// 使用 sessionCwd 而非 ctx.cwd，避免 terminate:true 后 ctx 失效。
 						try {
 							const endTime = new Date().toISOString();
 							const agent = agents.find(a => a.name === params.agent);

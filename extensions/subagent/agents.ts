@@ -1,5 +1,14 @@
 /**
  * Agent discovery and configuration
+ *
+ * Scans ~/.pi/agent/agents/ and/or .pi/agents/ for markdown files
+ * with YAML frontmatter (name, description, tools, model, source).
+ *
+ * Key functions:
+ *   discoverAgents(cwd, scope) — returns all discovered agents
+ *   getAgentDir(cwd, scope) — resolves agent directory paths
+ *   parseFrontmatter(content) — parses YAML frontmatter from markdown
+ *   getAgentDirScope(scope, cwd) — determines which directories to scan
  */
 
 import * as fs from "node:fs";

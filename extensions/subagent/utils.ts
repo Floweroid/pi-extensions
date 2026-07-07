@@ -1,3 +1,18 @@
+/**
+ * Subagent Utils — shared constants, helper functions, and formatting
+ *
+ * Constants:
+ *   SYNC_TIMEOUT_MS (120000) — subprocess timeout for sync mode
+ *   MAX_CONCURRENCY (4) — max parallel subprocesses
+ *
+ * Key functions:
+ *   getPiInvocation(args) — returns {command, args} for spawn()
+ *   writePromptToTempFile(name, content) — writes system prompt to temp dir
+ *   getFinalOutput(parsedMessages) — extracts last assistant text from messages
+ *   getDisplayItems(details, width) — format subagent results for TUI display
+ *   formatToolCall(args, width) — truncate tool call args for display
+ */
+
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";

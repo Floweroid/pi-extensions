@@ -1,3 +1,14 @@
+/**
+ * Subagent Types — Type definitions and TypeBox schemas
+ *
+ * Defines the tool call schemas (SingleCall, ParallelCall, ChainCall)
+ * registered with pi's registerTool, plus internal types like
+ * AgentDef, OnUpdateCallback, SingleResult, SubagentDetails.
+ *
+ * AgentDef extends AgentConfig with model and tools resolved from
+ * the agent's markdown frontmatter.
+ */
+
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentScope } from "./agents.ts";

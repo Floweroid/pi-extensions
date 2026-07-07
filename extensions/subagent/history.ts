@@ -1,3 +1,16 @@
+/**
+ * Subagent History — execution log persistence
+ *
+ * Saves subagent execution records to disk for debugging and review.
+ * Creates: <projectRoot>/.pi/subagent-logs/<timestamp>-<agent>/
+ *   - metadata.json  → execution metadata
+ *   - messages.json  → full conversation messages
+ *   - stdout.txt     → raw process stdout
+ *   - stderr.txt     → raw process stderr (if any)
+ *
+ * Errors are silently caught to avoid disrupting the main agent flow.
+ */
+
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";

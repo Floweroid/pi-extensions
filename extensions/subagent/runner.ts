@@ -1,3 +1,15 @@
+/**
+ * Subagent Runner — sync subprocess execution
+ *
+ * Handles spawn() + JSONL incremental parsing for sync-mode subagents.
+ * Features:
+ *   - Spawns pi --mode json -p with isolated flags
+ *   - Incremental JSONL parsing (buffer full lines, processLine)
+ *   - 120s timeout (SYNC_TIMEOUT_MS): SIGTERM → 5s → SIGKILL
+ *   - Detects tool errors from tool_execution_end events
+ *   - Supports onUpdate callback for live progress
+ */
+
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import type { Message } from "@earendil-works/pi-ai";
