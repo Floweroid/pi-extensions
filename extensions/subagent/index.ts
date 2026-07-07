@@ -30,6 +30,7 @@ import {
     MAX_CONCURRENCY,
     MAX_PARALLEL_TASKS,
     PER_TASK_OUTPUT_CAP,
+    SYNC_TIMEOUT_MS,
     formatUsageStats,
     getDisplayItems,
     getFinalOutput,
@@ -243,6 +244,7 @@ export default function (pi: ExtensionAPI) {
 					};
 
 				if (params.mode === "async") {
+const widgetId = `subagent-${Date.now()}`;
 					let doneCount = 0;
 					const totalTasks = params.tasks.length;
 					const taskEntries = params.tasks.map((t) => ({
@@ -253,7 +255,7 @@ export default function (pi: ExtensionAPI) {
 					}));
 
 					const updateWidget = () => {
-						sessionUi?.setWidget("subagent", (_tui, theme) => {
+						sessionUi?.setWidget(widgetId, (_tui, theme) => {
 							const box = new Box(1, 0, (text: string) => theme.bg("toolPendingBg", text));
 							box.addChild(new Text(theme.fg("toolTitle",
 								theme.bold(` ⏳ parallel [${doneCount}/${totalTasks} done] `)), 0, 0));
@@ -267,7 +269,7 @@ export default function (pi: ExtensionAPI) {
 						});
 					};
 
-					sessionUi?.setStatus("subagent", `⏳ ${totalTasks} subagents running...`);
+					sessionUi?.setStatus(widgetId, `⏳ ${totalTasks} subagents running...`);
 					updateWidget();
 
 					const spawnOne = async (t: typeof params.tasks[0], index: number) => {
@@ -282,8 +284,8 @@ export default function (pi: ExtensionAPI) {
 							pi.sendUserMessage(`[subagent ${t.agent}] ❌ Unknown agent.`, { deliverAs: "followUp" });
 							doneCount++;
 							if (doneCount >= totalTasks) {
-								sessionUi?.setWidget("subagent", undefined);
-								sessionUi?.setStatus("subagent", undefined);
+								sessionUi?.setWidget(widgetId, undefined);
+								sessionUi?.setStatus(widgetId, undefined);
 							} else {
 								updateWidget();
 							}
@@ -357,8 +359,8 @@ export default function (pi: ExtensionAPI) {
 							if (tmpPromptDir) try { fs.rmdirSync(tmpPromptDir); } catch { /* ignore */ }
 							doneCount++;
 							if (doneCount >= totalTasks) {
-								sessionUi?.setWidget("subagent", undefined);
-								sessionUi?.setStatus("subagent", undefined);
+								sessionUi?.setWidget(widgetId, undefined);
+								sessionUi?.setStatus(widgetId, undefined);
 							} else {
 								updateWidget();
 							}
@@ -570,6 +572,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				if (params.mode === "async") {
+					const widgetId = `subagent-${Date.now()}`;
 					// Async fire-and-inject: spawn immediately, inject result on completion
 					const args: string[] = [
 						"--mode", "json", "-p", "--no-session",
@@ -603,7 +606,7 @@ export default function (pi: ExtensionAPI) {
 					let latestText = "";
 					const startTime = Date.now();
 
-					sessionUi?.setStatus("subagent", `⏳ ${params.agent} 运行中...`);
+					sessionUi?.setStatus(widgetId, `⏳ ${params.agent} 运行中...`);
 
 					const proc = spawn(invocation.command, invocation.args, {
 						cwd: params.cwd ?? ctx.cwd,
@@ -641,7 +644,7 @@ export default function (pi: ExtensionAPI) {
 							} catch { /* ignore */ }
 						}
 
-						sessionUi?.setWidget("subagent", (_tui, theme) => {
+						sessionUi?.setWidget(widgetId, (_tui, theme) => {
 							const elapsed = Math.floor((Date.now() - startTime) / 1000);
 							const box = new Box(1, 0, (text: string) => theme.bg("toolPendingBg", text));
 
@@ -664,8 +667,8 @@ export default function (pi: ExtensionAPI) {
 					proc.stderr.on("data", (data) => { stderr += data.toString(); });
 
 					proc.on("close", (code) => {
-						sessionUi?.setWidget("subagent", undefined);
-						sessionUi?.setStatus("subagent", undefined);
+						sessionUi?.setWidget(widgetId, undefined);
+						sessionUi?.setStatus(widgetId, undefined);
 						if (wasKilled) return;
 						const lines = stdout.split("\n").filter(Boolean);
 						const parsed: Message[] = [];
@@ -699,8 +702,8 @@ export default function (pi: ExtensionAPI) {
 					});
 
 					proc.on("error", () => {
-						sessionUi?.setWidget("subagent", undefined);
-						sessionUi?.setStatus("subagent", undefined);
+						sessionUi?.setWidget(widgetId, undefined);
+						sessionUi?.setStatus(widgetId, undefined);
 						pi.sendUserMessage(
 							`[subagent ${params.agent}] ❌ 启动失败: ${stderr || "unknown error"}`,
 							{ deliverAs: "followUp" },
