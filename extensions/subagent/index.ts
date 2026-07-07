@@ -14,417 +14,40 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
-import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
-import { StringEnum } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, getMarkdownTheme, keyHint, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Markdown, Spacer, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { StringEnum, type Message } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+
+
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
-const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
-const SYNC_TIMEOUT_MS = 120_000; // 2-minute timeout for sync subagent execution
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
-}
-
-function formatUsageStats(
-	usage: {
-		input: number;
-		output: number;
-		cacheRead: number;
-		cacheWrite: number;
-		cost: number;
-		contextTokens?: number;
-		turns?: number;
-	},
-	model?: string,
-): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) {
-		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
-	}
-	if (model) parts.push(model);
-	return parts.join(" ");
-}
-
-function formatToolCall(
-	toolName: string,
-	args: Record<string, unknown>,
-	themeFg: (color: any, text: string) => string,
-): string {
-	const shortenPath = (p: string) => {
-		const home = os.homedir();
-		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
-	};
-
-	switch (toolName) {
-		case "bash": {
-			const command = (args.command as string) || "...";
-			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
-			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
-		}
-		case "read": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const offset = args.offset as number | undefined;
-			const limit = args.limit as number | undefined;
-			let text = themeFg("accent", filePath);
-			if (offset !== undefined || limit !== undefined) {
-				const startLine = offset ?? 1;
-				const endLine = limit !== undefined ? startLine + limit - 1 : "";
-				text += themeFg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
-			}
-			return themeFg("muted", "read ") + text;
-		}
-		case "write": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			const filePath = shortenPath(rawPath);
-			const content = (args.content || "") as string;
-			const lines = content.split("\n").length;
-			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
-			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
-			return text;
-		}
-		case "edit": {
-			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "ls": {
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
-		}
-		case "find": {
-			const pattern = (args.pattern || "*") as string;
-			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
-		}
-		case "grep": {
-			const pattern = (args.pattern || "") as string;
-			const rawPath = (args.path || ".") as string;
-			return (
-				themeFg("muted", "grep ") +
-				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
-		}
-		default: {
-			const argsStr = JSON.stringify(args);
-			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
-		}
-	}
-}
-
-interface UsageStats {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-	contextTokens: number;
-	turns: number;
-}
-
-interface SingleResult {
-	agent: string;
-	agentSource: "user" | "project" | "unknown";
-	task: string;
-	exitCode: number;
-	messages: Message[];
-	stderr: string;
-	usage: UsageStats;
-	model?: string;
-	stopReason?: string;
-	errorMessage?: string;
-	step?: number;
-}
-
-interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
-	agentScope: AgentScope;
-	projectAgentsDir: string | null;
-	results: SingleResult[];
-}
-
-function getFinalOutput(messages: Message[]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
-	}
-	return "";
-}
-
-function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
-}
-
-function getResultOutput(result: SingleResult): string {
-	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
-	}
-	return getFinalOutput(result.messages) || "(no output)";
-}
+import { saveSubagentHistory } from "./history.ts";
+import { renderCall, renderResult } from "./render.ts";
+import { runSingleAgent } from "./runner.ts";
+import type { OnUpdateCallback, SingleResult, SubagentDetails } from "./types.ts";
+import {
+    COLLAPSED_ITEM_COUNT,
+    MAX_CONCURRENCY,
+    MAX_PARALLEL_TASKS,
+    PER_TASK_OUTPUT_CAP,
+    formatUsageStats,
+    getDisplayItems,
+    getFinalOutput,
+    getPiInvocation,
+    getResultOutput,
+    isFailedResult,
+    mapWithConcurrencyLimit,
+    writePromptToTempFile,
+} from "./utils.ts";
 
 function truncateParallelOutput(output: string): string {
 	const byteLength = Buffer.byteLength(output, "utf8");
 	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
 	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
 	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
 		truncated = truncated.slice(0, -1);
 	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
-}
-
-type DisplayItem = { type: "text"; text: string } | { type: "toolCall"; name: string; args: Record<string, any> };
-
-function getDisplayItems(messages: Message[]): DisplayItem[] {
-	const items: DisplayItem[] = [];
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") items.push({ type: "text", text: part.text });
-				else if (part.type === "toolCall") items.push({ type: "toolCall", name: part.name, args: part.arguments });
-			}
-		}
-	}
-	return items;
-}
-
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
-		}
-	});
-	await Promise.all(workers);
-	return results;
-}
-
-async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-
-	const execName = path.basename(process.execPath).toLowerCase();
-	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) {
-		return { command: process.execPath, args };
-	}
-
-	return { command: "pi", args };
-}
-
-type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
-
-async function runSingleAgent(
-	defaultCwd: string,
-	agents: AgentConfig[],
-	agentName: string,
-	task: string,
-	cwd: string | undefined,
-	step: number | undefined,
-	signal: AbortSignal | undefined,
-	onUpdate: OnUpdateCallback | undefined,
-	makeDetails: (results: SingleResult[]) => SubagentDetails,
-): Promise<SingleResult> {
-	const agent = agents.find((a) => a.name === agentName);
-
-	if (!agent) {
-		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-		return {
-			agent: agentName,
-			agentSource: "unknown",
-			task,
-			exitCode: 1,
-			messages: [],
-			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			step,
-		};
-	}
-
-	const args: string[] = [
-		"--mode", "json", "-p", "--no-session",
-		"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
-	];
-	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
-
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
-
-	const currentResult: SingleResult = {
-		agent: agentName,
-		agentSource: agent.source,
-		task,
-		exitCode: 0,
-		messages: [],
-		stderr: "",
-		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
-		step,
-	};
-
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
-		}
-	};
-
-	try {
-		if (agent.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
-		}
-
-		args.push(`Task: ${task}`);
-		let wasAborted = false;
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
-			const proc = spawn(invocation.command, invocation.args, {
-				cwd: cwd ?? defaultCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env, PI_OFFLINE: "1" },
-			});
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
-					}
-					emitUpdate();
-				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
-			});
-
-			proc.on("error", () => {
-				resolve(1);
-			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
-		});
-
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
-		return currentResult;
-	} finally {
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
-	}
+	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted.]`;
 }
 
 const TaskItem = Type.Object({
@@ -462,6 +85,7 @@ const SubagentParams = Type.Object({
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
+
 
 export default function (pi: ExtensionAPI) {
 	let sessionUi: ExtensionContext["ui"] | null = null;
@@ -647,6 +271,8 @@ export default function (pi: ExtensionAPI) {
 					updateWidget();
 
 					const spawnOne = async (t: typeof params.tasks[0], index: number) => {
+						const startTimeMs = Date.now();
+						const startTime = new Date().toISOString();
 						if (index > 0) await new Promise((r) => setTimeout(r, 50));
 
 						const entry = taskEntries[index];
@@ -666,8 +292,9 @@ export default function (pi: ExtensionAPI) {
 
 						const args: string[] = [
 							"--mode", "json", "-p", "--no-session",
-							"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
+							"--no-skills", "--no-prompt-templates", "--no-context-files",
 						];
+						if (!(agent.tools && agent.tools.length > 0)) args.push("--no-extensions");
 						if (agent.model) args.push("--model", agent.model);
 						if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
@@ -739,33 +366,95 @@ export default function (pi: ExtensionAPI) {
 
 						proc.on("close", (code) => {
 							if (wasKilled) { finalize(); return; }
+							const rawStdout = stdout;
 							const lines = stdout.split("\n").filter(Boolean);
-							const parsed: Message[] = [];
+							const parsedMessages: Message[] = [];
+							const toolExecutions: Array<{ 
+								toolName: string; 
+								args: string; 
+								isError: boolean; 
+								result: string 
+							}> = [];
+
 							for (const line of lines) {
 								try {
 									const event = JSON.parse(line);
 									if ((event.type === "message_end" || event.type === "tool_result_end") && event.message)
-										parsed.push(event.message as Message);
+										parsedMessages.push(event.message as Message);
+									if (event.type === "tool_execution_start") {
+										toolExecutions.push({
+											toolName: event.toolName,
+											args: JSON.stringify(event.args || {}),
+											isError: false,
+											result: "",
+										});
+									}
+									if (event.type === "tool_execution_end") {
+										const last = toolExecutions[toolExecutions.length - 1];
+										if (last && last.toolName === event.toolName && !last.result) {
+											last.isError = event.isError === true;
+											last.result = event.isError
+												? (event.result?.content?.[0]?.text || "unknown error")
+												: event.result?.content?.[0]?.text || "(done)";
+										}
+									}
 								} catch { /* ignore */ }
 							}
 
+							const toolErrors = toolExecutions.filter(e => e.isError);
+
 							let output = "";
-							for (let i = parsed.length - 1; i >= 0; i--) {
-								if (parsed[i].role === "assistant") {
-									for (const part of parsed[i].content) {
+							for (let i = parsedMessages.length - 1; i >= 0; i--) {
+								if (parsedMessages[i].role === "assistant") {
+									for (const part of parsedMessages[i].content) {
 										if (part.type === "text") { output = part.text; break; }
 									}
 									if (output) break;
 								}
 							}
 
-							const status = code === 0 ? "✅" : "❌";
-							const resultText = output || stderr || "(无输出)";
-							entry.icon = code === 0 ? "✓" : "✗";
+							const hasToolErrors = toolErrors.length > 0;
+							const statusIcon = hasToolErrors ? "⚠️" : code === 0 ? "✅" : "❌";
+							const statusText = hasToolErrors
+								? `完成（${toolErrors.length}/${toolExecutions.length} 工具失败）`
+								: `完成（${toolExecutions.length} 工具调用）`;
+
+							let resultText = output || stderr || "(无输出)";
+							if (toolExecutions.length > 0) {
+								const maxArgs = 60;
+								resultText += `\n\n📋 工具执行:\n${toolExecutions.map(e => {
+									const argsPreview = e.args.length > maxArgs ? e.args.slice(0, maxArgs) + "..." : e.args;
+									const icon = e.isError ? "✗" : "✓";
+									return `  ${icon} ${e.toolName} ${argsPreview}${e.isError ? ` → ${e.result}` : ""}`;
+								}).join("\n")}`;
+							}
+
+							entry.icon = hasToolErrors ? "⚠" : code === 0 ? "✓" : "✗";
 							pi.sendUserMessage(
-								`[subagent ${t.agent}] ${status} 完成:\n\n${resultText}`,
+								`[subagent ${t.agent}] ${statusIcon} ${statusText}:\n\n${resultText}`,
 								{ deliverAs: "followUp" },
 							);
+
+							// Save execution history
+							const endTime = new Date().toISOString();
+							saveSubagentHistory({
+								agent: t.agent,
+								agentSource: agent.source,
+								model: agent.model,
+								task: t.task,
+								cwd: t.cwd ?? ctx.cwd,
+								startTime,
+								endTime,
+								durationMs: Date.now() - startTimeMs,
+								exitCode: code ?? 1,
+								hasToolErrors,
+								toolErrors,
+								output: resultText,
+								stderr,
+								messages: parsedMessages,
+								rawStdout,
+							}, ctx.cwd);
+
 							finalize();
 						});
 
@@ -884,8 +573,9 @@ export default function (pi: ExtensionAPI) {
 					// Async fire-and-inject: spawn immediately, inject result on completion
 					const args: string[] = [
 						"--mode", "json", "-p", "--no-session",
-						"--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
+						"--no-skills", "--no-prompt-templates", "--no-context-files",
 					];
+					if (!(agent.tools && agent.tools.length > 0)) args.push("--no-extensions");
 					if (agent.model) args.push("--model", agent.model);
 					if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
@@ -1106,296 +796,9 @@ export default function (pi: ExtensionAPI) {
 			};
 		},
 
-		renderCall(args, theme, context) {
-			const cache = context.state as { key?: string; lines?: string[]; width?: number };
-			const scope: AgentScope = args.agentScope ?? "user";
-			const key = JSON.stringify(args);
-
-			return {
-				invalidate() { cache.width = undefined; cache.lines = undefined; cache.key = undefined; },
-				render(width: number): string[] {
-					if (cache.key === key && cache.width === width && cache.lines) return cache.lines;
-					const out: string[] = [];
-
-					if (args.chain && args.chain.length > 0) {
-						out.push(truncateToWidth(
-							theme.fg("toolTitle", theme.bold("subagent ")) +
-							theme.fg("accent", `chain (${args.chain.length} steps)`) +
-							theme.fg("muted", ` [${scope}]`), width, "..."));
-						for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
-							const step = args.chain[i];
-							const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-							const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
-							out.push(truncateToWidth(
-								`  ${theme.fg("muted", `${i + 1}.`)} ${theme.fg("accent", step.agent)} ${theme.fg("dim", preview)}`,
-								width, "..."));
-						}
-						if (args.chain.length > 3)
-							out.push(truncateToWidth(theme.fg("muted", `  ... +${args.chain.length - 3} more`), width, "..."));
-					} else if (args.tasks && args.tasks.length > 0) {
-						const modeLabel = args.mode === "async" ? " 🔥" : "";
-						out.push(truncateToWidth(
-							theme.fg("toolTitle", theme.bold("subagent ")) +
-							theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
-							theme.fg("muted", ` [${scope}]${modeLabel}`), width, "..."));
-						for (const t of args.tasks.slice(0, 3)) {
-							const preview = t.task?.length > 40 ? `${t.task.slice(0, 40)}...` : (t.task || theme.fg("dim", "..."));
-							out.push(truncateToWidth(`  ${theme.fg("accent", t.agent || "?")} ${theme.fg("dim", preview)}`, width, "..."));
-						}
-						if (args.tasks.length > 3)
-							out.push(truncateToWidth(theme.fg("muted", `  ... +${args.tasks.length - 3} more`), width, "..."));
-					} else {
-						const agentName = args.agent || "...";
-						const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
-						const modeLabel = args.mode === "async" ? " 🔥" : "";
-						out.push(truncateToWidth(
-							theme.fg("toolTitle", theme.bold("subagent ")) +
-							theme.fg("accent", agentName) +
-							theme.fg("muted", ` [${scope}]${modeLabel}`), width, "..."));
-						out.push(truncateToWidth(`  ${theme.fg("dim", preview)}`, width, "..."));
-					}
-
-					cache.key = key; cache.width = width; cache.lines = out;
-					return out;
-				},
-			};
-		},
-
-		renderResult(result, { expanded }, theme, _context) {
-			const details = result.details as SubagentDetails | undefined;
-			const cache: { key?: string; width?: number; lines?: string[] } = {};
-			const mdTheme = getMarkdownTheme();
-
-			const renderDisplayItems = (items: DisplayItem[], limit?: number) => {
-				const toShow = limit ? items.slice(-limit) : items;
-				const skipped = limit && items.length > limit ? items.length - limit : 0;
-				let text = "";
-				if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
-				for (const item of toShow) {
-					if (item.type === "text") {
-						const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-						text += `${theme.fg("toolOutput", preview)}\n`;
-					} else {
-						text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
-					}
-				}
-				return text.trimEnd();
-			};
-
-			const aggregateUsage = (results: SingleResult[]) => {
-				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-				for (const r of results) {
-					total.input += r.usage.input;
-					total.output += r.usage.output;
-					total.cacheRead += r.usage.cacheRead;
-					total.cacheWrite += r.usage.cacheWrite;
-					total.cost += r.usage.cost;
-					total.turns += r.usage.turns;
-				}
-				return total;
-			};
-
-			const key = JSON.stringify({ expanded, mode: details?.mode, rlen: details?.results?.length ?? 0 });
-
-			return {
-				invalidate() { cache.width = undefined; cache.lines = undefined; cache.key = undefined; },
-				render(width: number): string[] {
-					if (cache.key === key && cache.width === width && cache.lines) return cache.lines;
-					const out: string[] = [];
-
-					if (!details?.results?.length) {
-						const t = result.content[0];
-						out.push(truncateToWidth(t?.type === "text" ? t.text : "(no output)", width, "..."));
-					} else if (details.mode === "single" && details.results.length === 1) {
-						const r = details.results[0];
-						const isRunning = r.exitCode === -1;
-						const isError = isFailedResult(r);
-						const icon = isRunning ? theme.fg("warning", "⏳") : isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
-
-						if (isRunning) {
-							out.push(truncateToWidth(
-								`${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)} ${theme.fg("warning", "[running...]")}`,
-								width, "..."));
-						} else {
-							const displayItems = getDisplayItems(r.messages);
-							const finalOutput = getFinalOutput(r.messages);
-							let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-							if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-							out.push(truncateToWidth(header, width, "..."));
-
-							if (isError && r.errorMessage)
-								out.push(truncateToWidth(theme.fg("error", `Error: ${r.errorMessage}`), width, "..."));
-
-							if (expanded) {
-								out.push(truncateToWidth(theme.fg("muted", "─── Task ───"), width, "..."));
-								out.push(truncateToWidth(theme.fg("dim", r.task), width, "..."));
-								out.push(truncateToWidth(theme.fg("muted", "─── Output ───"), width, "..."));
-								if (displayItems.length === 0 && !finalOutput) {
-									out.push(truncateToWidth(theme.fg("muted", "(no output)"), width, "..."));
-								} else {
-									for (const item of displayItems) {
-										if (item.type === "toolCall")
-											out.push(truncateToWidth(
-												theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-												width, "..."));
-									}
-									if (finalOutput) {
-										out.push("");
-										out.push(...new Markdown(finalOutput.trim(), 0, 0, mdTheme).render(width));
-									}
-								}
-							} else {
-								if (displayItems.length === 0)
-									out.push(truncateToWidth(theme.fg("muted", "(no output)"), width, "..."));
-								else
-									for (const line of renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT).split("\n"))
-										out.push(truncateToWidth(line, width, "..."));
-							}
-
-							const usageStr = formatUsageStats(r.usage, r.model);
-							const hint = expanded ? "" : `  ${keyHint("app.tools.expand", "expand for full output")}`;
-							out.push(truncateToWidth(`${usageStr ? theme.fg("dim", usageStr) : ""}${hint}`, width, "..."));
-						}
-
-					// Chain mode
-					} else if (details.mode === "chain") {
-						const successCount = details.results.filter((r) => r.exitCode === 0).length;
-						const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
-
-						if (expanded) {
-							out.push(truncateToWidth(
-								`${icon} ${theme.fg("toolTitle", theme.bold("chain "))}${theme.fg("accent", `${successCount}/${details.results.length} steps`)}`,
-								width, "..."));
-							for (const r of details.results) {
-								const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-								const displayItems = getDisplayItems(r.messages);
-								const finalOutput = getFinalOutput(r.messages);
-								out.push("");
-								out.push(truncateToWidth(
-									`${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`, width, "..."));
-								out.push(truncateToWidth(`${theme.fg("muted", "Task: ")}${theme.fg("dim", r.task)}`, width, "..."));
-								for (const item of displayItems) {
-									if (item.type === "toolCall")
-										out.push(truncateToWidth(
-											theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-											width, "..."));
-								}
-								if (finalOutput) {
-									out.push("");
-									out.push(...new Markdown(finalOutput.trim(), 0, 0, mdTheme).render(width));
-								}
-								const stepUsage = formatUsageStats(r.usage, r.model);
-								if (stepUsage)
-									out.push(truncateToWidth(theme.fg("dim", stepUsage), width, "..."));
-							}
-							const totalUsage = formatUsageStats(aggregateUsage(details.results));
-							if (totalUsage) {
-								out.push("");
-								out.push(truncateToWidth(theme.fg("dim", `Total: ${totalUsage}`), width, "..."));
-							}
-						} else {
-							out.push(truncateToWidth(
-								`${icon} ${theme.fg("toolTitle", theme.bold("chain "))}${theme.fg("accent", `${successCount}/${details.results.length} steps`)}`,
-								width, "..."));
-							for (const r of details.results) {
-								const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
-								const displayItems = getDisplayItems(r.messages);
-								out.push("");
-								out.push(truncateToWidth(
-									`${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`,
-									width, "..."));
-								if (displayItems.length === 0)
-									out.push(truncateToWidth(theme.fg("muted", "(no output)"), width, "..."));
-								else
-									for (const line of renderDisplayItems(displayItems, 5).split("\n"))
-										out.push(truncateToWidth(line, width, "..."));
-							}
-							const totalUsage = formatUsageStats(aggregateUsage(details.results));
-							const hint = keyHint("app.tools.expand", "expand for full output");
-							out.push(truncateToWidth(
-								`${totalUsage ? theme.fg("dim", `Total: ${totalUsage}`) : ""}  ${theme.fg("muted", hint)}`,
-								width, "..."));
-						}
-
-					// Parallel mode
-					} else if (details.mode === "parallel") {
-						const running = details.results.filter((r) => r.exitCode === -1).length;
-						const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-						const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
-						const isRunningMode = running > 0;
-						const icon = isRunningMode ? theme.fg("warning", "⏳") : failCount > 0 ? theme.fg("warning", "◐") : theme.fg("success", "✓");
-						const status = isRunningMode
-							? `${successCount + failCount}/${details.results.length} done, ${running} running`
-							: `${successCount}/${details.results.length} tasks`;
-
-						if (expanded && !isRunningMode) {
-							out.push(truncateToWidth(
-								`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`, width, "..."));
-							for (const r of details.results) {
-								const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
-								const displayItems = getDisplayItems(r.messages);
-								const finalOutput = getFinalOutput(r.messages);
-								out.push("");
-								out.push(truncateToWidth(
-									`${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`, width, "..."));
-								out.push(truncateToWidth(`${theme.fg("muted", "Task: ")}${theme.fg("dim", r.task)}`, width, "..."));
-								for (const item of displayItems) {
-									if (item.type === "toolCall")
-										out.push(truncateToWidth(
-											theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-											width, "..."));
-								}
-								if (finalOutput) {
-									out.push("");
-									out.push(...new Markdown(finalOutput.trim(), 0, 0, mdTheme).render(width));
-								}
-								const taskUsage = formatUsageStats(r.usage, r.model);
-								if (taskUsage)
-									out.push(truncateToWidth(theme.fg("dim", taskUsage), width, "..."));
-							}
-							const totalUsage = formatUsageStats(aggregateUsage(details.results));
-							if (totalUsage) {
-								out.push("");
-								out.push(truncateToWidth(theme.fg("dim", `Total: ${totalUsage}`), width, "..."));
-							}
-						} else {
-							out.push(truncateToWidth(
-								`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
-								width, "..."));
-							for (const r of details.results) {
-								const rIcon = r.exitCode === -1 ? theme.fg("warning", "⏳") : isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
-								const displayItems = getDisplayItems(r.messages);
-								out.push("");
-								out.push(truncateToWidth(
-									`${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${rIcon}`,
-									width, "..."));
-								if (displayItems.length === 0)
-									out.push(truncateToWidth(
-										theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)"),
-										width, "..."));
-								else
-									for (const line of renderDisplayItems(displayItems, 5).split("\n"))
-										out.push(truncateToWidth(line, width, "..."));
-							}
-							if (!isRunningMode) {
-								const totalUsage = formatUsageStats(aggregateUsage(details.results));
-								const hint = keyHint("app.tools.expand", "expand for full output");
-								out.push(truncateToWidth(
-									`${totalUsage ? theme.fg("dim", `Total: ${totalUsage}`) : ""}  ${theme.fg("muted", hint)}`,
-									width, "..."));
-							} else {
-								out.push(truncateToWidth(
-									theme.fg("muted", keyHint("app.tools.expand", "expand for full output")),
-									width, "..."));
-							}
-						}
-					}
-
-					cache.key = key; cache.width = width; cache.lines = out;
-					return out;
-				},
-			};
-		},
+		renderCall,
+		renderResult,
 	});
 
 }
+
