@@ -21,7 +21,7 @@ export function renderCall(args, theme, context) {
 							theme.fg("muted", ` [${scope}]`), width, "..."));
 						for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
 							const step = args.chain[i];
-							const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
+							const cleanTask = (step.task || "").replace(/\{previous\}/g, "").trim();
 							const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
 							out.push(truncateToWidth(
 								`  ${theme.fg("muted", `${i + 1}.`)} ${theme.fg("accent", step.agent)} ${theme.fg("dim", preview)}`,

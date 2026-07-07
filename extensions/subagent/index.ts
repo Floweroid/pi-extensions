@@ -90,9 +90,11 @@ const SubagentParams = Type.Object({
 
 export default function (pi: ExtensionAPI) {
 	let sessionUi: ExtensionContext["ui"] | null = null;
+	let sessionCwd: string | null = null;
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionUi = ctx.ui;
+		sessionCwd = ctx.cwd;
 	});
 	pi.registerTool({
 		name: "subagent",
@@ -320,13 +322,13 @@ const widgetId = `subagent-${Date.now()}`;
 						let finalized = false;
 
 						const proc = spawn(invocation.command, invocation.args, {
-							cwd: t.cwd ?? ctx.cwd,
+							cwd: t.cwd ?? sessionCwd,
 							shell: false,
 							stdio: ["ignore", "pipe", "pipe"],
 							env: { ...process.env, PI_OFFLINE: "1" },
 						});
 
-						let lastRender = 0;
+						let lastParallelStateKey = "";
 						proc.stdout.on("data", (data) => {
 							stdout += data.toString();
 							const lines = stdout.split("\n");
@@ -347,8 +349,11 @@ const widgetId = `subagent-${Date.now()}`;
 									}
 								} catch { /* ignore */ }
 							}
-							const now = Date.now();
-							if (now - lastRender > 100) { updateWidget(); lastRender = now; }
+							const stateKey = taskEntries.map(e => `${e.icon}|${e.activity?.slice(-20)}`).join("||");
+							if (stateKey !== lastParallelStateKey) {
+								lastParallelStateKey = stateKey;
+								updateWidget();
+							}
 						});
 						proc.stderr.on("data", (data) => { stderr += data.toString(); });
 
@@ -444,7 +449,7 @@ const widgetId = `subagent-${Date.now()}`;
 								agentSource: agent.source,
 								model: agent.model,
 								task: t.task,
-								cwd: t.cwd ?? ctx.cwd,
+								cwd: t.cwd ?? sessionCwd,
 								startTime,
 								endTime,
 								durationMs: Date.now() - startTimeMs,
@@ -455,7 +460,7 @@ const widgetId = `subagent-${Date.now()}`;
 								stderr,
 								messages: parsedMessages,
 								rawStdout,
-							}, ctx.cwd);
+							}, sessionCwd);
 
 							finalize();
 						});
@@ -604,6 +609,7 @@ const widgetId = `subagent-${Date.now()}`;
 					let parsedIndex = 0;
 					const toolLines: string[] = [];
 					let latestText = "";
+					let lastSingleStateKey = "";
 					const startTime = Date.now();
 
 					sessionUi?.setStatus(widgetId, `⏳ ${params.agent} 运行中...`);
@@ -643,6 +649,10 @@ const widgetId = `subagent-${Date.now()}`;
 								}
 							} catch { /* ignore */ }
 						}
+
+						const stateKey = `${toolLines.length}|${latestText?.slice(-30)||""}`;
+						if (stateKey === lastSingleStateKey) return;
+						lastSingleStateKey = stateKey;
 
 						sessionUi?.setWidget(widgetId, (_tui, theme) => {
 							const elapsed = Math.floor((Date.now() - startTime) / 1000);
@@ -696,6 +706,53 @@ const widgetId = `subagent-${Date.now()}`;
 							`[subagent ${params.agent}] ${status} 完成:\n\n${resultText}`,
 							{ deliverAs: "followUp" },
 						);
+
+						// Save execution history
+						try {
+							const endTime = new Date().toISOString();
+							const agent = agents.find(a => a.name === params.agent);
+							const toolExecutions: Array<{ toolName: string; args: string; isError: boolean; result: string }> = [];
+							for (const line of lines) {
+								try {
+									const event = JSON.parse(line);
+									if (event.type === "tool_execution_start") {
+										toolExecutions.push({
+											toolName: event.toolName,
+											args: JSON.stringify(event.args || {}),
+											isError: false,
+											result: "",
+										});
+									}
+									if (event.type === "tool_execution_end") {
+										const last = toolExecutions[toolExecutions.length - 1];
+										if (last && last.toolName === event.toolName && !last.result) {
+											last.isError = event.isError === true;
+											last.result = event.isError
+												? (event.result?.content?.[0]?.text || "unknown error")
+												: event.result?.content?.[0]?.text || "(done)";
+										}
+									}
+								} catch { /* ignore */ }
+							}
+							const toolErrors = toolExecutions.filter(e => e.isError);
+							saveSubagentHistory({
+								agent: params.agent,
+								agentSource: agent?.source ?? "user",
+								model: agent?.model,
+								task: params.task,
+								cwd: params.cwd ?? sessionCwd ?? process.cwd(),
+								startTime: startTime instanceof Date ? startTime.toISOString() : new Date(startTime).toISOString(),
+								endTime,
+								durationMs: Date.now() - startTime,
+								exitCode: code ?? 1,
+								hasToolErrors: toolErrors.length > 0,
+								toolErrors,
+								output: resultText,
+								stderr,
+								messages: parsed,
+								rawStdout: stdout,
+							}, sessionCwd ?? process.cwd());
+						} catch { /* silent */ }
 
 						if (tmpPromptPath) try { fs.unlinkSync(tmpPromptPath); } catch { /* ignore */ }
 						if (tmpPromptDir) try { fs.rmdirSync(tmpPromptDir); } catch { /* ignore */ }
