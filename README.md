@@ -3,6 +3,16 @@
 > **14 个扩展 · 8 个事件钩子 · 5 个自定义工具 · 5,000+ 行 TypeScript**  
 > 为 pi AI coding agent 构建的扩展库。日常 90% 代码由 AI 辅助生成。
 
+## 快速开始
+
+```bash
+git clone https://github.com/Floweroid/pi-extensions.git
+
+# 将扩展链接到 pi 配置目录
+# macOS/Linux:  ln -s $(pwd)/pi-extensions/extensions ~/.pi/extensions
+# Windows:     mklink /D %USERPROFILE%\.pi\extensions pi-extensions\extensions
+```
+
 ## 核心数据
 
 | 维度 | 数字 |
@@ -40,6 +50,23 @@
 每个扩展都有独立的设计文档，包括：解决什么问题、技术方案、关键决策、在 Agent 生命周期中的位置。
 
 → **[文档索引](./docs/INDEX.md)**
+
+## 开发新扩展
+
+```bash
+# 1. 从模板创建
+cp -r extensions/_template extensions/my-extension
+
+# 2. 编辑 index.ts（必须导出两个函数）
+export function activate(api: PiApi): void   # 注册工具/钩子
+export function deactivate?(): void          # 清理（可选）
+
+# 3. 重启 pi 即可加载
+```
+
+每个扩展建议附带：
+- `README.md` — 一句话描述 + 用法
+- `docs/` — 独立设计文档（非必须，复杂扩展需要）
 
 ## 安装
 
