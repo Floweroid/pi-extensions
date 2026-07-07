@@ -43,7 +43,11 @@ git clone https://github.com/Floweroid/pi-extensions.git
 | **跨平台** | pi 在 Windows 上只能走 bash 桥接，编码混乱 | powershell · async-tasks |
 | **中文生态** | 压缩产出的摘要是英文，系统提示词也是英文 | zh-compaction · zh-tools |
 | **自主工作** | Agent 不能离开人 — 危险操作没法确认，也没法通知用户 | permission-gate · windows-notify |
-| **多 Agent 协作** | 无法拆分复杂任务到子代理并行处理 | subagent（single/parallel/chain） |
+| **多 Agent 协作** | 无法拆分复杂任务到子代理并行处理 | subagent（single/parallel/chain · 7 模块） |
+
+> subagent 为最复杂扩展（原 1400 行单体）→ 重构为 7 个模块：  
+> `index.ts`（注册+工具处理）· `types.ts`（类型定义）· `runner.ts`（子进程执行）  
+> `render.ts`（TUI 渲染）· `history.ts`（会话历史）· `agents.ts`（代理发现）· `utils.ts`（工具函数）
 
 ## 文档
 
